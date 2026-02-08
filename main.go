@@ -1,14 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
 	"runtime/pprof"
-	"strings"
 	"sync"
 	"time"
 )
@@ -17,6 +18,8 @@ import (
 	Design Plan
 
 whiteboard: https://miro.com/app/board/uXjVGL2ZYSQ=/?share_link_id=504796011623
+Theres probably a deadlock due to the way I am using channels, will learn about them deeply
+before implementing a fix. We sure are getting lucky here with our outputs working atleast.
 *
 * create a slice of all url (additionally create a text file or fetch it from somewhere)
 1. create a slice of url
@@ -31,13 +34,8 @@ whiteboard: https://miro.com/app/board/uXjVGL2ZYSQ=/?share_link_id=504796011623
 if website is up print [UP] url else [DOWN] url
 */
 
-
-
-type isUpRes struct {
-	isUp       bool
-	statusCode int
-}
-
+// Workers write to stdout if a url in jobs channel is up or down
+// They also write true or false for the same in Result channel
 func Worker(_ int, jobs <-chan string, Result chan<- bool) {
 	for url := range jobs {
 		ok := isUp(url)
@@ -51,63 +49,82 @@ func Worker(_ int, jobs <-chan string, Result chan<- bool) {
 	}
 }
 
-func isUp(url string) isUpRes {
-	result := isUpRes{}
+// isUpResult bundles the output of isUp function
+type isUpResult struct {
+	isUp       bool
+	statusCode int
+}
+
+// isUP sends a GET request to provided URL
+// implicit http.CheckRedirect calls have been turned off by the http client
+// Returns struct isUpResult based on response's statusCode
+func isUp(url string) isUpResult {
+	result := isUpResult{statusCode: -1}
 	client := http.Client{
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 		Timeout: 10 * time.Second,
 	}
-	req, err := http.NewRequest("Get", "https://"+url, nil)
-	agent := "wcheck/1.0 (Language=Go)"
-	req.Header.Set("User-Agent", agent)
+
+	req, err := http.NewRequest(http.MethodGet, "https://"+url, nil)
+	if err != nil {
+		fmt.Printf("%s\n", err)
+		return result
+	}
+
+	req.Header.Set("User-Agent", "wcheck/1.0 (Language=Go)")
+
 	res, err := client.Do(req)
 	if err != nil {
-		fmt.Println(err)
-		result.isUp = false
-		result.statusCode = -1
+		fmt.Printf("%s\n", err)
 		return result
 	}
 	res.Body.Close()
+
 	result.isUp = res.StatusCode >= 200 && res.StatusCode <= 420
 	result.statusCode = res.StatusCode
 	return result
 }
 
-func isValidUrl(url string) bool {
+// isValidURL uses regex to return true for valid urls
+func isValidURL(url string) bool {
 	re := regexp.MustCompile(`^(https?://)?([\da-z.-]+)\.([a-z.]{2,6})([/\w .-]*)*/?$`)
 	return re.MatchString(url)
 }
 
-func giveUrls(filename string) []string {
-	fileByte, err := os.ReadFile(filename)
-	if err != nil {
-		panic(err)
-	}
-	urls := strings.Split(string(fileByte), "\n")
-	FinalUrls := []string{}
-	for _, val := range urls {
-		if isValidUrl(val) {
-			FinalUrls = append(FinalUrls, val)
+// parseURLS returns a slice of filtered valid urls
+func parseURLS(r io.Reader) []string {
+	var validURL []string
+	ns := bufio.NewScanner(r)
+	for ns.Scan() {
+		text := ns.Text()
+		if isValidURL(text) {
+			validURL = append(validURL, text)
 		}
 	}
-	return FinalUrls
+	return validURL
 }
 
 func main() {
 	fmt.Println("Welcome to wcheck !!")
 
-	//arguments handling
+	// Get inputFile and number of workers system can afford
 	var numOfWorkers int
-	flag.IntVar(&numOfWorkers, "n", 10, "define number of Workers needed, keep it below 10k or else bye bye system")
-	var filename string
-	flag.StringVar(&filename, "w", "./majestic", "choose the wordlist of urls needed")
+	var inputFile string
+	flag.IntVar(&numOfWorkers, "n", 10, "define number of Workers needed, keep it below 10k.")
+	flag.StringVar(&inputFile, "w", "./majestic", "choose the wordlist of urls needed")
 	flag.Parse()
 
-	Finalurls := giveUrls(filename)
+	fd, err := os.Open(inputFile)
+	if err != nil {
+		fmt.Printf("%s\n", err)
+		return
+	}
 
-	// track for Ctrl + C Interrupt
+	URLS := parseURLS(fd)
+
+	// Track for Ctrl + C Interrupt
 	successCount := 0
 	failCount := 0
 	c := make(chan os.Signal, 1)
@@ -120,11 +137,10 @@ func main() {
 		}
 	}()
 
-	//make channels
-	jobs := make(chan string, len(Finalurls))
-	Result := make(chan bool, len(Finalurls))
+	// Make workers
+	jobs := make(chan string, len(URLS))
+	Result := make(chan bool, len(URLS))
 
-	//make workers
 	var wg sync.WaitGroup
 	for i := 0; i < numOfWorkers; i++ {
 		wg.Go(func() {
@@ -132,11 +148,12 @@ func main() {
 		})
 	}
 
-	//fill channels
-	for _, url := range Finalurls {
+	// Keep signalling in the jobs channel
+	for _, url := range URLS {
 		jobs <- url
 	}
-	//increment counters
+
+	// Count success and failures from Result channel
 	for res := range Result {
 		if res {
 			successCount++
